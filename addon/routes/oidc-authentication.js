@@ -17,6 +17,10 @@ export default class OIDCAuthenticationRoute extends Route {
   queryParams = {
     code: { refreshModel: false },
     state: { refreshModel: false },
+    access_token: { refreshModel: false },
+    id_token: { refreshModel: false },
+    token_type: { refreshModel: false },
+    expires_in: { refreshModel: false },
   };
 
   get redirectUri() {
@@ -29,10 +33,57 @@ export default class OIDCAuthenticationRoute extends Route {
     location.replace(url);
   }
 
+  /**
+   * Parse tokens from URL fragment (hash).
+   * Implicit flow typically returns tokens in the URL fragment (after #).
+   *
+   * @returns {Object|null} Object containing token parameters or null if no fragment
+   */
+  _parseTokensFromFragment() {
+    const hash = location.hash;
+    if (!hash || hash.length <= 1) {
+      return null;
+    }
+
+    // Remove leading # and parse as query string
+    const params = new URLSearchParams(hash.substring(1));
+    const result = {};
+
+    // Extract token-related parameters
+    if (params.has("access_token")) {
+      result.access_token = params.get("access_token");
+    }
+    if (params.has("id_token")) {
+      result.id_token = params.get("id_token");
+    }
+    if (params.has("token_type")) {
+      result.token_type = params.get("token_type");
+    }
+    if (params.has("expires_in")) {
+      result.expires_in = parseInt(params.get("expires_in"), 10);
+    }
+    if (params.has("state")) {
+      result.state = params.get("state");
+    }
+
+    return Object.keys(result).length > 0 ? result : null;
+  }
+
   async beforeModel(transition) {
     await this.config.loadConfig();
 
-    if (transition.from) {
+    const queryParams =
+      (transition.to ? transition.to.queryParams : transition.queryParams) ||
+      {};
+
+    // Check if this is an implicit grant callback or authorization code callback
+    // If so, skip prohibitAuthentication to allow re-authentication with new tokens
+    const fragmentTokens = this._parseTokensFromFragment();
+    const hasImplicitGrantTokens =
+      fragmentTokens?.access_token || queryParams.access_token;
+    const hasAuthorizationCode = queryParams.code;
+
+    if (transition.from && !hasImplicitGrantTokens && !hasAuthorizationCode) {
       this.session.prohibitAuthentication(transition.from.name);
     }
 
@@ -50,12 +101,15 @@ export default class OIDCAuthenticationRoute extends Route {
   /**
    * Handle unauthenticated requests
    *
-   * This handles two cases:
+   * This handles three cases:
    *
-   * 1. The URL contains an authentication code and a state. In this case the
-   *    client will try to authenticate with the given parameters.
+   * 1. The URL contains tokens (implicit grant flow). In this case the
+   *    client will authenticate with the provided tokens.
    *
-   * 2. The URL does not contain an authentication. In this case the client
+   * 2. The URL contains an authentication code and a state (authorization code flow).
+   *    In this case the client will try to authenticate with the given parameters.
+   *
+   * 3. The URL does not contain tokens or code. In this case the client
    *    will be redirected to the configured identity provider login mask, which will
    *    then redirect to this route after a successful login.
    *
@@ -65,6 +119,8 @@ export default class OIDCAuthenticationRoute extends Route {
    * @param {Object} transition.to.queryParams The query params of the transition
    * @param {String} transition.to.queryParams.code The authentication code given by the identity provider
    * @param {String} transition.to.queryParams.state The state given by the identity provider
+   * @param {String} transition.to.queryParams.access_token The access token (implicit flow)
+   * @param {String} transition.to.queryParams.id_token The ID token (implicit flow)
    */
   async afterModel(_, transition) {
     await this.config.loadConfig();
@@ -75,10 +131,30 @@ export default class OIDCAuthenticationRoute extends Route {
       );
     }
 
-    const queryParams = transition.to
-      ? transition.to.queryParams
-      : transition.queryParams;
+    const queryParams =
+      (transition.to ? transition.to.queryParams : transition.queryParams) ||
+      {};
 
+    // Check for implicit grant tokens in URL fragment (hash)
+    const fragmentTokens = this._parseTokensFromFragment();
+    if (fragmentTokens?.access_token) {
+      return await this._handleImplicitGrantCallback(fragmentTokens);
+    }
+
+    // Check for implicit grant tokens in query params
+    if (queryParams.access_token) {
+      const tokenParams = {
+        access_token: queryParams.access_token,
+        id_token: queryParams.id_token,
+        expires_in: queryParams.expires_in
+          ? parseInt(queryParams.expires_in, 10)
+          : undefined,
+        state: queryParams.state,
+      };
+      return await this._handleImplicitGrantCallback(tokenParams);
+    }
+
+    // Authorization code flow
     if (queryParams.code) {
       return await this._handleCallbackRequest(
         queryParams.code,
@@ -88,6 +164,48 @@ export default class OIDCAuthenticationRoute extends Route {
     }
 
     return this._handleRedirectRequest(queryParams);
+  }
+
+  /**
+   * Authenticate with tokens received directly from implicit grant flow.
+   *
+   * This will check if the passed state equals the state in the application to
+   * prevent from CSRF attacks.
+   *
+   * @param {Object} tokenParams The token parameters
+   * @param {String} tokenParams.access_token The access token
+   * @param {String} tokenParams.id_token The ID token
+   * @param {Number} tokenParams.expires_in Token expiry in seconds
+   * @param {String} tokenParams.state The state (uuid4) passed by the identity provider
+   */
+  async _handleImplicitGrantCallback(tokenParams) {
+    const { access_token, id_token, expires_in, state } = tokenParams;
+
+    // Validate state to prevent CSRF attacks
+    if (state && state !== this.session.data.state) {
+      assert("State did not match");
+    }
+
+    this.session.set("data.state", undefined);
+
+    // Clear URL hash to remove tokens from URL
+    if (location.hash) {
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+
+    // Invalidate existing session if present to allow re-authentication with new tokens
+    if (this.session.isAuthenticated) {
+      await this.session.invalidate();
+    }
+
+    const data = {
+      access_token,
+      id_token,
+      expires_in,
+      redirectUri: this.redirectUri,
+    };
+
+    await this.session.authenticate("authenticator:oidc", data);
   }
 
   /**
