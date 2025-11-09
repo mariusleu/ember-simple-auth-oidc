@@ -51,6 +51,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
         redirectUri,
         DEFAULT_RETRY_COUNT,
         customParams,
+        this.session.data.authenticated.grant_type,
       );
     }
 
@@ -62,6 +63,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
         expires_in: options.expires_in,
         refresh_token: options.refresh_token,
         redirectUri,
+        grant_type: "implicit",
       });
     }
 
@@ -89,8 +91,9 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     const isBadRequest = isBadRequestResponse(response);
     if (isBadRequest) throw data;
 
-    // Store the redirect URI in the session for the restore call
+    // Store the redirect URI and grant type in the session for the restore call
     data.redirectUri = redirectUri;
+    data.grant_type = "authorization_code";
 
     return this._handleAuthResponse(data);
   }
@@ -179,7 +182,13 @@ export default class OidcAuthenticator extends BaseAuthenticator {
 
     // Authorization code flow with refresh token
     if (expireTime && expireTime <= new Date().getTime()) {
-      return await this._refresh(refresh_token, redirectUri);
+      return await this._refresh(
+        refresh_token,
+        redirectUri,
+        0,
+        {},
+        sessionData.grant_type,
+      );
     }
 
     return sessionData;
@@ -189,6 +198,10 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * Refresh the access token
    *
    * @param {String} refresh_token The refresh token
+   * @param {String} redirectUri The redirect URI
+   * @param {Number} retryCount The number of retries attempted
+   * @param {Object} customParams Custom parameters to include
+   * @param {String} grant_type The original grant type
    * @returns {Object} The parsed response data
    */
   async _refresh(
@@ -196,6 +209,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     redirectUri,
     retryCount = 0,
     customParams = {},
+    grant_type,
   ) {
     let isServerError = false;
     try {
@@ -226,8 +240,9 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       const isBadRequest = isBadRequestResponse(response);
       if (isBadRequest) return Promise.reject(data);
 
-      // Store the redirect URI in the session for the restore call
+      // Store the redirect URI and grant type in the session for the restore call
       data.redirectUri = redirectUri;
+      data.grant_type = grant_type;
 
       return this._handleAuthResponse(data);
     } catch (e) {
@@ -240,7 +255,13 @@ export default class OidcAuthenticator extends BaseAuthenticator {
             this,
             () =>
               resolve(
-                this._refresh(refresh_token, redirectUri, retryCount + 1),
+                this._refresh(
+                  refresh_token,
+                  redirectUri,
+                  retryCount + 1,
+                  customParams,
+                  grant_type,
+                ),
               ),
             this.config.retryTimeout,
           );
@@ -280,6 +301,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
    * @param {String} response.access_token The raw access token
    * @param {String} response.refresh_token The raw refresh token
    * @param {Number} response.expires_in Seconds until access_token expires
+   * @param {String} response.grant_type The grant type used (authorization_code or implicit)
    * @returns {Object} The authentication data
    */
   async _handleAuthResponse({
@@ -288,6 +310,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
     expires_in,
     id_token,
     redirectUri,
+    grant_type,
   }) {
     const userinfo = await this._getUserinfo(access_token);
 
@@ -304,6 +327,7 @@ export default class OidcAuthenticator extends BaseAuthenticator {
       id_token,
       expireTime,
       redirectUri,
+      grant_type,
     });
   }
 
